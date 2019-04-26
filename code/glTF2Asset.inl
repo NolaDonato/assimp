@@ -551,17 +551,42 @@ inline void BufferView::Read(Value& obj, Asset& r)
 
 inline void Accessor::Read(Value& obj, Asset& r)
 {
-
-    if (Value* bufferViewVal = FindUInt(obj, "bufferView")) {
-        bufferView = r.bufferViews.Retrieve(bufferViewVal->GetUint());
-    }
-
-    byteOffset = MemberOrDefault(obj, "byteOffset", 0u);
-    componentType = MemberOrDefault(obj, "componentType", ComponentType_BYTE);
-    count = MemberOrDefault(obj, "count", 0u);
-
     const char* typestr;
+    Value* bv;
+    componentType = MemberOrDefault(obj, "componentType", ComponentType_BYTE);
     type = ReadMember(obj, "type", typestr) ? AttribType::FromString(typestr) : AttribType::SCALAR;
+    count = MemberOrDefault(obj, "count", 0u);
+    if (Value* sparse = FindObject(obj, "sparse"))
+    {
+        if (Value* inds = FindObject(*sparse, "indices"))
+        {
+            indices = new Accessor();
+            indices->type = AttribType::SCALAR;
+            indices->count = MemberOrDefault(*sparse, "count", 0u);
+            indices->byteOffset = MemberOrDefault(*inds, "byteOffset", 0u);
+            indices->componentType = MemberOrDefault(*inds, "componentType", ComponentType_BYTE);
+            if ((bv = FindUInt(*inds, "bufferView")))
+            {
+                indices->bufferView = r.bufferViews.Retrieve(bv->GetUint());
+            }
+        }
+        if (Value* vals = FindObject(*sparse, "values"))
+        {
+            if ((bv = FindUInt(*vals, "bufferView")))
+            {
+                bufferView = r.bufferViews.Retrieve(bv->GetUint());
+            }
+            byteOffset = MemberOrDefault(*vals, "byteOffset", 0u);
+        }
+    }
+    else
+    {
+        if ((bv = FindUInt(obj, "bufferView")))
+        {
+            bufferView = r.bufferViews.Retrieve(bv->GetUint());
+        }
+        byteOffset = MemberOrDefault(obj, "byteOffset", 0u);
+    }
 }
 
 inline unsigned int Accessor::GetNumComponents()
@@ -626,28 +651,71 @@ template<class T>
 bool Accessor::ExtractData(T*& outData)
 {
     uint8_t* data = GetPointer();
-    if (!data) return false;
-
+    if (!data)
+        return false;
     const size_t elemSize = GetElementSize();
     const size_t totalSize = elemSize * count;
-
     const size_t stride = bufferView && bufferView->byteStride ? bufferView->byteStride : elemSize;
-
     const size_t targetElemSize = sizeof(T);
     ai_assert(elemSize <= targetElemSize);
-
-    ai_assert(count*stride <= bufferView->byteLength);
-
     outData = new T[count];
-    if (stride == elemSize && targetElemSize == elemSize) {
-        memcpy(outData, data, totalSize);
+
+    /**
+     * Support for sparse accessors which uses an index table
+     * designating the index of each value in data buffer.
+     * Reading from a sparse accessor will "flatten" the
+     * data, putting zeros in the output buffer for
+     * entries which have no corresponding index.
+     */
+    if (indices)
+    {
+        const size_t numIndices = indices->count;
+        uint8_t* indexData = indices->GetPointer();
+        if (!indexData)
+            return false;
+        const size_t indexSize = indices->GetElementSize();
+        ai_assert(indexSize <= sizeof(int));
+
+        memset(outData, 0, numIndices * indexSize);
+        switch (indexSize)
+        {
+            case sizeof(short):
+            for (size_t i = 0; i < numIndices; ++i)
+            {
+                u_short index = *(((u_short*) indexData) + i);
+                memcpy(outData + index, data + i * stride, elemSize);
+            }
+            break;
+
+            case sizeof(int):
+            for (size_t i = 0; i < numIndices; ++i)
+            {
+                u_int index = *(((u_int*) indexData) + i);
+                memcpy(outData + index, data + i * stride, elemSize);
+            }
+            break;
+
+            default:
+                return false;
+        }
+
     }
-    else {
-        for (size_t i = 0; i < count; ++i) {
-            memcpy(outData + i, data + i*stride, elemSize);
+    else
+    {
+        ai_assert(count * stride <= bufferView->byteLength);
+
+        if (stride == elemSize && targetElemSize == elemSize)
+        {
+            memcpy(outData, data, totalSize);
+        }
+        else
+        {
+            for (size_t i = 0; i < count; ++i)
+            {
+                memcpy(outData + i, data + i * stride, elemSize);
+            }
         }
     }
-
     return true;
 }
 
@@ -964,11 +1032,6 @@ namespace {
 
 inline void Mesh::Read(Value& pJSON_Object, Asset& pAsset_Root)
 {
-    std::ofstream f;
-    f.open("/sdcard/assimp2.txt", std::ios_base::app);
-    f<<"inside read mesh \n";
-    f.close();
-
     if (Value* name = FindMember(pJSON_Object, "name")) {
         this->name = name->GetString();
     }
